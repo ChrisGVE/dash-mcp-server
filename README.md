@@ -38,7 +38,7 @@ This is a work in progress. Any suggestions are welcome!
 
 - macOS (required for Dash app)
 - [Dash](https://kapeli.com/dash) installed
-- Python 3.11.4 or higher
+- Python 3.12 or higher
 - uv
 
 ## Configuration
