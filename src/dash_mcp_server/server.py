@@ -244,7 +244,7 @@ def parse_fragment(load_url: str) -> Optional[str]:
     if not fragment:
         return None
     if fragment.startswith("//dash_ref_"):
-        anchor = fragment[len("//dash_ref_"):].split("/")[0]
+        anchor = fragment[len("//dash_ref_") :].split("/")[0]
         return anchor if anchor else None
     return fragment
 
@@ -278,23 +278,40 @@ def extract_section(html: str, anchor_id: Optional[str]) -> str:
     for tag in soup.find_all(["nav", "aside", "header", "footer"]):
         tag.decompose()
 
-
     body = soup.body
     return str(body) if body else str(soup)
 
 
+def _as_jsonable(obj):
+    """Convert Pydantic models to plain dicts, including ones nested inside containers.
+
+    `json.dumps` cannot serialize a model, and its `default=` fallback would stringify one
+    into its repr — a different length from the JSON that actually gets sent.
+    """
+    if hasattr(obj, "model_dump"):  # Pydantic model
+        return _as_jsonable(obj.model_dump())
+    if isinstance(obj, dict):
+        return {k: _as_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_as_jsonable(item) for item in obj]
+    return obj
+
+
 def estimate_tokens(obj) -> int:
-    """Estimate token count for a serialized object. Rough approximation: 1 token ≈ 4 characters."""
-    if isinstance(obj, str):
-        return max(1, len(obj) // 4)
-    elif isinstance(obj, (list, tuple)):
-        return sum(estimate_tokens(item) for item in obj)
-    elif isinstance(obj, dict):
-        return sum(estimate_tokens(k) + estimate_tokens(v) for k, v in obj.items())
-    elif hasattr(obj, "model_dump"):  # Pydantic model
-        return estimate_tokens(obj.model_dump())
-    else:
-        return max(1, len(str(obj)) // 4)
+    """Estimate token count for a serialized object. Rough approximation: 1 token ≈ 4 characters.
+
+    The estimate is taken over the object's JSON serialization, which is what is actually
+    sent. Summing each field's length separately misses everything JSON adds around them —
+    quotes, colons, commas, braces, and `null` for every unset optional field — and rounds
+    each field down independently, so it reports well under the real size on responses made
+    of many small records.
+    """
+    try:
+        serialized = json.dumps(_as_jsonable(obj), default=str)
+    except (TypeError, ValueError):
+        serialized = str(obj)
+
+    return max(1, len(serialized) // 4)
 
 
 @mcp.tool()
