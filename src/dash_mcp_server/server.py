@@ -399,6 +399,42 @@ def estimate_tokens(obj) -> int:
     return max(1, round(estimate))
 
 
+def response_limit_note() -> str:
+    """The truncation sentence for a tool description, or nothing when nothing is capped.
+
+    A tool description stating a number the operator did not choose is worse than no
+    number at all: the model plans against 25,000 while the server trims at 4,000, or
+    budgets for a truncation that a limit of zero means will never happen. The sentence
+    is therefore built from the resolved limit, and omitted entirely when there isn't one.
+
+    Read once, when the tools are registered. That is the same moment the server reads
+    everything else out of its environment, so the two only disagree if something mutates
+    os.environ while the process runs.
+    """
+    limit = token_limit(RESPONSE_TOKEN_LIMIT_VARIABLE, DEFAULT_RESPONSE_TOKEN_LIMIT)
+    if not limit:
+        return ""
+    return (
+        f" Results are truncated if they would exceed {limit:,} tokens, "
+        f"set by {RESPONSE_TOKEN_LIMIT_VARIABLE}."
+    )
+
+
+def retrieval_limit_note() -> str:
+    """The same, for the page loader, whose default is no limit at all."""
+    limit = token_limit(RETRIEVAL_TOKEN_LIMIT_VARIABLE, DEFAULT_RETRIEVAL_TOKEN_LIMIT)
+    if not limit:
+        return (
+            " A whole page is returned unless max_tokens is given: the operator has set "
+            "no default limit."
+        )
+    return (
+        f" Pages are truncated at {limit:,} tokens unless max_tokens overrides it, "
+        f"set by {RETRIEVAL_TOKEN_LIMIT_VARIABLE}. Pass next_offset back as offset to "
+        "read the rest."
+    )
+
+
 def fit_within_token_limit(items: list, limit: int) -> list:
     """Return the longest leading run of `items` whose JSON fits within `limit` tokens.
 
@@ -510,11 +546,18 @@ def take_token_budget(
     return remainder[:cut], offset + cut
 
 
-@mcp.tool()
+@mcp.tool(
+    description=(
+        "List all installed documentation sets in Dash. An empty list is returned if "
+        "the user has no docsets installed." + response_limit_note()
+    )
+)
 async def list_installed_docsets(ctx: Context) -> DocsetResults:
-    """List all installed documentation sets in Dash. An empty list is returned if the user has no docsets installed.
-    Results are truncated if they would exceed the DASH_RESPONSE_TOKEN_LIMIT
-    environment variable, which defaults to 25,000 tokens. Zero means no limit."""
+    """List all installed documentation sets in Dash.
+
+    The description registered with the tool is built above, so that the truncation
+    sentence carries the operator's own limit rather than a number baked in here.
+    """
     try:
         base_url = await working_api_base_url(ctx)
         if base_url is None:
@@ -573,7 +616,18 @@ async def list_installed_docsets(ctx: Context) -> DocsetResults:
         return DocsetResults(error=f"Failed to get installed docsets: {e}")
 
 
-@mcp.tool()
+@mcp.tool(
+    description=(
+        "Search for documentation across docset identifiers and snippets.\n\n"
+        "Args:\n"
+        "    query: The search query string\n"
+        "    docset_identifiers: Comma-separated list of docset identifiers to search "
+        "in (from list_installed_docsets)\n"
+        "    search_snippets: Whether to include snippets in search results\n"
+        "    max_results: Maximum number of results to return (1-1000)"
+        + response_limit_note()
+    )
+)
 async def search_documentation(
     ctx: Context,
     query: str,
@@ -581,17 +635,10 @@ async def search_documentation(
     search_snippets: bool = True,
     max_results: int = 100,
 ) -> SearchResults:
-    """
-    Search for documentation across docset identifiers and snippets.
+    """Search for documentation across docset identifiers and snippets.
 
-    Args:
-        query: The search query string
-        docset_identifiers: Comma-separated list of docset identifiers to search in (from list_installed_docsets)
-        search_snippets: Whether to include snippets in search results
-        max_results: Maximum number of results to return (1-1000)
-
-    Results are truncated if they would exceed the DASH_RESPONSE_TOKEN_LIMIT
-    environment variable, which defaults to 25,000 tokens. Zero means no limit.
+    The description registered with the tool is built above, so that the truncation
+    sentence carries the operator's own limit rather than a number baked in here.
     """
     if not query.strip():
         await ctx.error("Query cannot be empty")
@@ -768,29 +815,34 @@ async def enable_docset_fts(ctx: Context, identifier: str) -> bool:
     return True
 
 
-@mcp.tool()
+@mcp.tool(
+    description=(
+        "Load a documentation page from a load_url returned by search_documentation.\n\n"
+        "Args:\n"
+        "    load_url: The load_url value from a search result (must point to the local "
+        "Dash API at 127.0.0.1)\n"
+        "    offset: Character offset to start reading from. Pass the next_offset of a "
+        "previous call to continue a page that was truncated. Defaults to the start of "
+        "the page.\n"
+        "    max_tokens: Maximum size of the returned content, in tokens. Zero means no "
+        "limit. Omit it to use the limit the operator configured.\n\n"
+        "Returns:\n"
+        "    The documentation page content as plain text with markdown-style links. "
+        "Pages larger than the budget are cut at a line boundary; truncated is then true "
+        "and next_offset says where to resume."
+        + retrieval_limit_note()
+    )
+)
 async def load_documentation_page(
     ctx: Context,
     load_url: str,
     offset: int = 0,
     max_tokens: Optional[int] = None,
 ) -> DocumentationPage:
-    """
-    Load a documentation page from a load_url returned by search_documentation.
+    """Load a documentation page from a load_url returned by search_documentation.
 
-    Args:
-        load_url: The load_url value from a search result (must point to the local Dash API at 127.0.0.1)
-        offset: Character offset to start reading from. Pass the next_offset of a previous
-            call to continue a page that was truncated. Defaults to the start of the page.
-        max_tokens: Maximum size of the returned content, in tokens. Zero means no
-            limit. Omit it to use the DASH_RETRIEVAL_TOKEN_LIMIT environment variable,
-            which the person running the server sets; that is unset by default, so a
-            whole page is returned unless someone chose otherwise.
-
-    Returns:
-        The documentation page content as plain text with markdown-style links. Pages larger
-        than the budget are cut at a line boundary; truncated is then true and next_offset
-        says where to resume.
+    The description registered with the tool is built above, so that the size sentence
+    carries the operator's own limit rather than a number baked in here.
     """
     if offset < 0:
         await ctx.error("offset cannot be negative")

@@ -624,3 +624,54 @@ class TestSearchRespectsTheResponseLimit(ResponseLimitHarness):
         monkeypatch.delenv(server.RESPONSE_TOKEN_LIMIT_VARIABLE, raising=False)
         result, _ = self._run(monkeypatch, 100)
         assert len(result.results) == 100
+
+
+class TestToolDescriptionsFollowTheConfiguration:
+    """A description naming a number the operator did not choose misleads the model."""
+
+    def test_the_default_limit_is_stated_with_its_variable(self, monkeypatch):
+        monkeypatch.delenv(server.RESPONSE_TOKEN_LIMIT_VARIABLE, raising=False)
+        note = server.response_limit_note()
+        assert "25,000" in note
+        assert server.RESPONSE_TOKEN_LIMIT_VARIABLE in note
+
+    def test_a_configured_limit_replaces_the_default(self, monkeypatch):
+        monkeypatch.setenv(server.RESPONSE_TOKEN_LIMIT_VARIABLE, "4000")
+        note = server.response_limit_note()
+        assert "4,000" in note
+        assert "25,000" not in note
+
+    def test_no_limit_means_no_truncation_sentence(self, monkeypatch):
+        monkeypatch.setenv(server.RESPONSE_TOKEN_LIMIT_VARIABLE, "0")
+        assert server.response_limit_note() == ""
+
+    def test_the_page_loader_says_so_when_nothing_is_capped(self, monkeypatch):
+        monkeypatch.delenv(server.RETRIEVAL_TOKEN_LIMIT_VARIABLE, raising=False)
+        note = server.retrieval_limit_note()
+        assert "whole page" in note
+        assert "truncated at" not in note
+
+    def test_the_page_loader_states_a_configured_limit(self, monkeypatch):
+        monkeypatch.setenv(server.RETRIEVAL_TOKEN_LIMIT_VARIABLE, "8000")
+        note = server.retrieval_limit_note()
+        assert "8,000" in note
+        assert server.RETRIEVAL_TOKEN_LIMIT_VARIABLE in note
+
+    def test_the_registered_descriptions_carry_the_note(self):
+        """What the model actually receives, read back off the server's own registry.
+
+        Registration happens at import, so this pins the wiring rather than the value:
+        the note must reach the description the client is handed, not just exist.
+        """
+        registered = {
+            tool.name: tool.description
+            for tool in asyncio.run(server.mcp.list_tools())
+        }
+
+        for name in ("list_installed_docsets", "search_documentation"):
+            assert server.RESPONSE_TOKEN_LIMIT_VARIABLE in registered[name]
+            assert "25,000 tokens" in registered[name]
+
+        page = registered["load_documentation_page"]
+        assert "whole page is returned" in page
+        assert "25,000" not in page
