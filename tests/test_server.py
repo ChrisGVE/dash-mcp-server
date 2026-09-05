@@ -254,3 +254,152 @@ class TestListInstalledDocsetsFilter:
     ):
         results, _ = self._list(monkeypatch, filter="sqlachemy")
         assert results.suggestions[0].identifier == "eeee5555"
+
+
+class RoutingFakeClient:
+    """Fake httpx.Client that answers /docsets/list and /search differently.
+
+    The combined tool makes two calls, so a single-payload fake cannot exercise it.
+    Records the params of the /search call, which is where the resolved identifiers
+    show up.
+    """
+
+    def __init__(self, docsets, search_payload, search_status=None):
+        self._docsets = docsets
+        self._search_payload = search_payload
+        self._search_status = search_status
+        self.search_params = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, **kwargs):
+        if url.endswith("/docsets/list"):
+            return FakeResponse({"docsets": self._docsets})
+        self.search_params = kwargs.get("params")
+        if self._search_status is not None:
+            raise self._search_status
+        return FakeResponse(self._search_payload)
+
+
+class TestSearchDocumentationByFilter:
+    def _search(self, monkeypatch, docsets=None, search_payload=None, **kwargs):
+        async def fake_base_url(ctx):
+            return "http://127.0.0.1:1234"
+
+        client = RoutingFakeClient(
+            DOCSETS if docsets is None else docsets,
+            {"results": []} if search_payload is None else search_payload,
+        )
+        monkeypatch.setattr(server, "working_api_base_url", fake_base_url)
+        monkeypatch.setattr(server.httpx, "Client", lambda *a, **kw: client)
+        ctx = FakeContext()
+        params = {"query": "chain", "docset_filter": "python"}
+        params.update(kwargs)
+        return asyncio.run(server.search_documentation_by_filter(ctx, **params)), ctx, client
+
+    def test_the_filter_is_resolved_to_identifiers_before_searching(self, monkeypatch):
+        _, _, client = self._search(monkeypatch)
+        assert client.search_params["docset_identifiers"] == "aaaa1111,cccc3333,bbbb2222"
+
+    def test_it_reports_which_docsets_it_decided_to_search(self, monkeypatch):
+        results, _, _ = self._search(monkeypatch)
+        assert [d.name for d in results.searched_docsets] == [
+            "Python 3.14.6",
+            "Pythonista 3.1",
+            "IPython 7.14.0",
+        ]
+
+    def test_the_platform_is_reported_alongside_the_name(self, monkeypatch):
+        results, _, _ = self._search(monkeypatch)
+        assert [d.platform for d in results.searched_docsets] == [
+            "python",
+            "pythonista",
+            "ipython",
+        ]
+
+    def test_the_identifier_is_not_echoed_back(self, monkeypatch):
+        results, _, _ = self._search(monkeypatch)
+        assert not hasattr(results.searched_docsets[0], "identifier")
+
+    def test_the_query_reaches_dash_unchanged(self, monkeypatch):
+        _, _, client = self._search(monkeypatch, query="itertools.chain")
+        assert client.search_params["query"] == "itertools.chain"
+
+    def test_results_come_back_as_from_the_identifier_based_tool(self, monkeypatch):
+        payload = {
+            "results": [
+                {
+                    "name": "chain",
+                    "type": "Class",
+                    "load_url": "http://127.0.0.1:1234/x.html",
+                    "docset": "Python",
+                }
+            ]
+        }
+        results, _, _ = self._search(monkeypatch, search_payload=payload)
+        assert [r.name for r in results.results] == ["chain"]
+        assert results.error is None
+
+    def test_a_filter_matching_nothing_searches_nothing_and_says_so(self, monkeypatch):
+        results, _, client = self._search(monkeypatch, docset_filter="react")
+        assert client.search_params is None
+        assert results.results == []
+        assert results.searched_docsets == []
+        assert "react" in results.error
+
+    def test_an_unmatched_filter_offers_the_near_misses_by_name(self, monkeypatch):
+        results, _, _ = self._search(monkeypatch, docset_filter="react")
+        assert "Racket 9.2" in results.error
+
+    def test_an_empty_filter_is_refused_rather_than_searching_everything(
+        self, monkeypatch
+    ):
+        results, _, client = self._search(monkeypatch, docset_filter="   ")
+        assert client.search_params is None
+        assert "docset_filter" in results.error
+
+    def test_an_empty_query_is_refused(self, monkeypatch):
+        results, _, client = self._search(monkeypatch, query="  ")
+        assert client.search_params is None
+        assert "Query" in results.error
+
+    def test_every_bad_argument_is_reported_together(self, monkeypatch):
+        results, _, _ = self._search(monkeypatch, query="", max_results=0)
+        assert "Query" in results.error
+        assert "max_results" in results.error
+
+    def test_max_results_is_bounded_like_the_identifier_based_tool(self, monkeypatch):
+        results, _, client = self._search(monkeypatch, max_results=1001)
+        assert client.search_params is None
+        assert "max_results" in results.error
+
+    def test_a_single_match_searches_just_that_docset(self, monkeypatch):
+        _, _, client = self._search(monkeypatch, docset_filter="racket")
+        assert client.search_params["docset_identifiers"] == "ffff6666"
+
+    def test_a_shared_platform_searches_all_of_its_docsets(self, monkeypatch):
+        results, _, client = self._search(monkeypatch, docset_filter="cheatsheet")
+        assert client.search_params["docset_identifiers"] == "gggg7777,hhhh8888"
+        assert len(results.searched_docsets) == 2
+
+    def test_dash_reporting_an_indexing_message_does_not_lose_the_results(
+        self, monkeypatch
+    ):
+        payload = {
+            "message": "Some docsets were busy indexing and were not searched.",
+            "results": [
+                {
+                    "name": "chain",
+                    "type": "Class",
+                    "load_url": "http://127.0.0.1:1234/x.html",
+                    "docset": "Python",
+                }
+            ],
+        }
+        results, ctx, _ = self._search(monkeypatch, search_payload=payload)
+        assert [r.name for r in results.results] == ["chain"]
+        assert any(kind == "warning" for kind, _ in ctx.messages)

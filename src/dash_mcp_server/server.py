@@ -176,6 +176,18 @@ class DocsetResult(BaseModel):
     )
 
 
+class SearchedDocset(BaseModel):
+    """A docset that a filtered search actually covered."""
+
+    name: str = Field(description="Display name of the docset")
+    platform: str = Field(
+        description="Platform tag of the docset. Worth reading alongside the name: it is "
+        "not derivable from it for most docsets, and it is what distinguishes an official "
+        "docset from a user-contributed one, which bears on how much weight to give the "
+        "results"
+    )
+
+
 class DocsetResults(BaseModel):
     """Result from listing docsets."""
 
@@ -221,6 +233,13 @@ class SearchResults(BaseModel):
     )
     error: Optional[str] = Field(
         description="Error message if there was an issue", default=None
+    )
+    searched_docsets: list[SearchedDocset] = Field(
+        description="The docsets that were actually searched, in the order the filter "
+        "ranked them. Populated when the caller named a filter rather than identifiers, "
+        "so it can see what the filter resolved to — a filter matching more, or fewer, "
+        "docsets than intended is otherwise invisible",
+        default_factory=list,
     )
 
 
@@ -635,6 +654,89 @@ async def search_documentation(
         return SearchResults(
             error=f"Search failed: {e}. Please ensure Dash is running and the API server is enabled (in Dash Settings > Integration)."
         )
+
+
+@mcp.tool()
+async def search_documentation_by_filter(
+    ctx: Context,
+    query: str,
+    docset_filter: str,
+    search_snippets: bool = True,
+    max_results: int = 100,
+) -> SearchResults:
+    """
+    Search documentation in the docsets matching a filter, without needing identifiers.
+
+    Prefer this over search_documentation. Dash requires an explicit list of docsets and
+    rejects a search that names none, but its identifiers are opaque eight-character keys
+    that can only be learned by listing every installed docset first. This tool takes the
+    name you already know — "python", "rust", "postgres" — resolves it, and searches what
+    it matches, so the listing round-trip is not needed.
+
+    Scoping matters more than it looks. Dash matches entry names and has no notion of what
+    the caller meant, so an unscoped query returns whichever docset happens to contain the
+    word: searching every installed docset for "yield" returns Rust and Haskell before
+    Python. Naming the docset is how intent is expressed.
+
+    Args:
+        query: The search query string
+        docset_filter: Name, platform tag or identifier of the docsets to search, matched
+            case-insensitively as a substring — "python" finds Python, Pythonista and
+            IPython; "cheatsheet" finds all of them
+        search_snippets: Whether to include snippets in search results
+        max_results: Maximum number of results to return (1-1000)
+
+    The docsets the filter resolved to are named in `searched_docsets`, so a filter that
+    matched more or fewer than intended is visible rather than silent. When the filter
+    matches nothing, `error` says so and names any near-misses; nothing is searched,
+    because searching a plausible wrong docset and finding the symbol absent would suggest
+    it is undocumented when the docset is simply not installed.
+    """
+    problems = []
+    if not query.strip():
+        problems.append("Query cannot be empty")
+    if not docset_filter.strip():
+        problems.append(
+            "docset_filter cannot be empty. Name the language, library or platform to "
+            "search, e.g. 'python'. To search by identifier instead, use "
+            "search_documentation"
+        )
+    if max_results < 1 or max_results > 1000:
+        problems.append("max_results must be between 1 and 1000")
+
+    if problems:
+        for problem in problems:
+            await ctx.error(problem)
+        return SearchResults(error="; ".join(problems))
+
+    listing = await list_installed_docsets(ctx, filter=docset_filter)
+    if listing.error is not None:
+        return SearchResults(error=listing.error)
+
+    if not listing.docsets:
+        message = f"No installed docset matches '{docset_filter}'."
+        if listing.suggestions:
+            names = ", ".join(docset.name for docset in listing.suggestions)
+            message += f" Did you mean: {names}?"
+        else:
+            message += (
+                " Run list_installed_docsets to see what is installed, or install the "
+                "docset in Dash."
+            )
+        await ctx.error(message)
+        return SearchResults(error=message)
+
+    identifiers = ",".join(docset.identifier for docset in listing.docsets)
+    await ctx.debug(f"Filter '{docset_filter}' resolved to: {identifiers}")
+
+    results = await search_documentation(
+        ctx, query, identifiers, search_snippets, max_results
+    )
+    results.searched_docsets = [
+        SearchedDocset(name=docset.name, platform=docset.platform)
+        for docset in listing.docsets
+    ]
+    return results
 
 
 @mcp.tool()
