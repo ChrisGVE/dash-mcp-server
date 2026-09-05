@@ -460,25 +460,167 @@ class TestLoadDocumentationPageSize:
 
 class TestTokenLimitFromEnvironment:
     def test_absent_falls_back_to_the_default(self, monkeypatch):
-        monkeypatch.delenv("DASH_RESPONSE_TOKEN_LIMIT", raising=False)
-        assert server.token_limit("DASH_RESPONSE_TOKEN_LIMIT", 25000) == 25000
+        monkeypatch.delenv(server.RESPONSE_TOKEN_LIMIT_VARIABLE, raising=False)
+        assert server.token_limit(server.RESPONSE_TOKEN_LIMIT_VARIABLE, 25000) == 25000
 
     def test_blank_falls_back_to_the_default(self, monkeypatch):
-        monkeypatch.setenv("DASH_RESPONSE_TOKEN_LIMIT", "   ")
-        assert server.token_limit("DASH_RESPONSE_TOKEN_LIMIT", 25000) == 25000
+        monkeypatch.setenv(server.RESPONSE_TOKEN_LIMIT_VARIABLE, "   ")
+        assert server.token_limit(server.RESPONSE_TOKEN_LIMIT_VARIABLE, 25000) == 25000
 
     def test_unparseable_falls_back_rather_than_failing(self, monkeypatch):
-        monkeypatch.setenv("DASH_RESPONSE_TOKEN_LIMIT", "lots")
-        assert server.token_limit("DASH_RESPONSE_TOKEN_LIMIT", 25000) == 25000
+        monkeypatch.setenv(server.RESPONSE_TOKEN_LIMIT_VARIABLE, "lots")
+        assert server.token_limit(server.RESPONSE_TOKEN_LIMIT_VARIABLE, 25000) == 25000
 
     def test_zero_is_honoured_as_no_limit(self, monkeypatch):
-        monkeypatch.setenv("DASH_RESPONSE_TOKEN_LIMIT", "0")
-        assert server.token_limit("DASH_RESPONSE_TOKEN_LIMIT", 25000) == 0
+        monkeypatch.setenv(server.RESPONSE_TOKEN_LIMIT_VARIABLE, "0")
+        assert server.token_limit(server.RESPONSE_TOKEN_LIMIT_VARIABLE, 25000) == 0
 
     def test_a_negative_value_reads_as_no_limit(self, monkeypatch):
-        monkeypatch.setenv("DASH_RESPONSE_TOKEN_LIMIT", "-5")
-        assert server.token_limit("DASH_RESPONSE_TOKEN_LIMIT", 25000) == 0
+        monkeypatch.setenv(server.RESPONSE_TOKEN_LIMIT_VARIABLE, "-5")
+        assert server.token_limit(server.RESPONSE_TOKEN_LIMIT_VARIABLE, 25000) == 0
 
     def test_a_set_value_wins(self, monkeypatch):
-        monkeypatch.setenv("DASH_RESPONSE_TOKEN_LIMIT", "1200")
-        assert server.token_limit("DASH_RESPONSE_TOKEN_LIMIT", 25000) == 1200
+        monkeypatch.setenv(server.RESPONSE_TOKEN_LIMIT_VARIABLE, "1200")
+        assert server.token_limit(server.RESPONSE_TOKEN_LIMIT_VARIABLE, 25000) == 1200
+
+
+class FakeJsonResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class FakeJsonClient:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, **kwargs):
+        return FakeJsonResponse(self._payload)
+
+
+def many_docsets(count):
+    return {
+        "docsets": [
+            {
+                "name": f"Example Docset {i} 1.0.0",
+                "identifier": f"docset{i:04d}",
+                "platform": f"example{i}",
+                "full_text_search": "enabled",
+                "notice": None,
+            }
+            for i in range(count)
+        ]
+    }
+
+
+def many_results(count):
+    return {
+        "results": [
+            {
+                "name": f"example_symbol_{i}",
+                "type": "Function",
+                "platform": "python",
+                "load_url": f"http://127.0.0.1:1234/page{i}",
+                "docset": "Python",
+                "description": f"Documentation for example_symbol_{i}.",
+            }
+            for i in range(count)
+        ]
+    }
+
+
+class ResponseLimitHarness:
+    """Runs a tool against a canned Dash payload, with the API reachable."""
+
+    def _call(self, monkeypatch, payload, tool):
+        async def fake_base_url(ctx):
+            return "http://127.0.0.1:1234"
+
+        monkeypatch.setattr(server, "working_api_base_url", fake_base_url)
+        monkeypatch.setattr(
+            server.httpx, "Client", lambda *a, **kw: FakeJsonClient(payload)
+        )
+        ctx = FakeContext()
+        return asyncio.run(tool(ctx)), ctx
+
+
+class TestDocsetListingRespectsTheResponseLimit(ResponseLimitHarness):
+    def _run(self, monkeypatch, count):
+        return self._call(
+            monkeypatch, many_docsets(count), server.list_installed_docsets
+        )
+
+    def test_a_low_limit_truncates_and_names_the_variable(self, monkeypatch):
+        monkeypatch.setenv(server.RESPONSE_TOKEN_LIMIT_VARIABLE, "300")
+        result, ctx = self._run(monkeypatch, 200)
+        assert 0 < len(result.docsets) < 200
+        assert any(
+            kind == "warning" and server.RESPONSE_TOKEN_LIMIT_VARIABLE in message
+            for kind, message in ctx.messages
+        )
+
+    def test_zero_returns_every_docset(self, monkeypatch):
+        monkeypatch.setenv(server.RESPONSE_TOKEN_LIMIT_VARIABLE, "0")
+        result, _ = self._run(monkeypatch, 2000)
+        assert len(result.docsets) == 2000
+
+    def test_without_the_variable_the_default_applies(self, monkeypatch):
+        monkeypatch.delenv(server.RESPONSE_TOKEN_LIMIT_VARIABLE, raising=False)
+        result, ctx = self._run(monkeypatch, 4000)
+        assert 0 < len(result.docsets) < 4000
+        assert estimate_tokens(result.docsets) <= server.DEFAULT_RESPONSE_TOKEN_LIMIT
+        assert any(
+            kind == "warning" and str(server.DEFAULT_RESPONSE_TOKEN_LIMIT) in message
+            for kind, message in ctx.messages
+        )
+
+
+class TestSearchRespectsTheResponseLimit(ResponseLimitHarness):
+    def _run(self, monkeypatch, count):
+        def tool(ctx):
+            return server.search_documentation(
+                ctx, query="example", docset_identifiers="docset0000"
+            )
+
+        return self._call(monkeypatch, many_results(count), tool)
+
+    def test_a_low_limit_truncates_and_names_the_variable(self, monkeypatch):
+        monkeypatch.setenv(server.RESPONSE_TOKEN_LIMIT_VARIABLE, "300")
+        result, ctx = self._run(monkeypatch, 200)
+        assert 0 < len(result.results) < 200
+        assert any(
+            kind == "warning" and server.RESPONSE_TOKEN_LIMIT_VARIABLE in message
+            for kind, message in ctx.messages
+        )
+
+    def test_zero_returns_every_result(self, monkeypatch):
+        monkeypatch.setenv(server.RESPONSE_TOKEN_LIMIT_VARIABLE, "0")
+        result, _ = self._run(monkeypatch, 2000)
+        assert len(result.results) == 2000
+
+    def test_without_the_variable_the_default_applies(self, monkeypatch):
+        monkeypatch.delenv(server.RESPONSE_TOKEN_LIMIT_VARIABLE, raising=False)
+        result, ctx = self._run(monkeypatch, 4000)
+        assert 0 < len(result.results) < 4000
+        assert estimate_tokens(result.results) <= server.DEFAULT_RESPONSE_TOKEN_LIMIT
+        assert any(
+            kind == "warning" and str(server.DEFAULT_RESPONSE_TOKEN_LIMIT) in message
+            for kind, message in ctx.messages
+        )
+
+    def test_the_retrieval_variable_does_not_affect_search(self, monkeypatch):
+        monkeypatch.setenv(server.RETRIEVAL_TOKEN_LIMIT_VARIABLE, "10")
+        monkeypatch.delenv(server.RESPONSE_TOKEN_LIMIT_VARIABLE, raising=False)
+        result, _ = self._run(monkeypatch, 100)
+        assert len(result.results) == 100

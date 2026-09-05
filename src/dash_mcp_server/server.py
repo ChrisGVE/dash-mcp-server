@@ -513,7 +513,8 @@ def take_token_budget(
 @mcp.tool()
 async def list_installed_docsets(ctx: Context) -> DocsetResults:
     """List all installed documentation sets in Dash. An empty list is returned if the user has no docsets installed.
-    Results are automatically truncated if they would exceed 25,000 tokens."""
+    Results are truncated if they would exceed the DASH_RESPONSE_TOKEN_LIMIT
+    environment variable, which defaults to 25,000 tokens. Zero means no limit."""
     try:
         base_url = await working_api_base_url(ctx)
         if base_url is None:
@@ -589,7 +590,8 @@ async def search_documentation(
         search_snippets: Whether to include snippets in search results
         max_results: Maximum number of results to return (1-1000)
 
-    Results are automatically truncated if they would exceed 25,000 tokens.
+    Results are truncated if they would exceed the DASH_RESPONSE_TOKEN_LIMIT
+    environment variable, which defaults to 25,000 tokens. Zero means no limit.
     """
     if not query.strip():
         await ctx.error("Query cannot be empty")
