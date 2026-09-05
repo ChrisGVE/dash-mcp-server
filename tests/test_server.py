@@ -1,8 +1,12 @@
+import asyncio
 import json
 
+from dash_mcp_server import server
 from dash_mcp_server.server import (
     SearchResult,
     estimate_tokens,
+    estimate_text_tokens,
+    take_token_budget,
     extract_section,
     fit_within_token_limit,
     parse_fragment,
@@ -254,3 +258,227 @@ class TestFitWithinTokenLimit:
 
     def test_a_limit_below_the_first_record_keeps_nothing(self):
         assert fit_within_token_limit(search_results(10), 1) == []
+
+class TestEstimateTextTokens:
+    def test_prose_estimate_exceeds_json_estimate_for_the_same_text(self):
+        # Page text is mostly letters and spaces, which the JSON calibration
+        # under-counts; the text profile must not inherit that under-count.
+        text = "The quick brown fox jumps over the lazy dog. " * 200
+        assert estimate_text_tokens(text) > 0
+        assert estimate_text_tokens(text) >= len(text) // 8
+
+    def test_estimate_grows_with_length(self):
+        one = estimate_text_tokens("Documentation paragraph about sockets. ")
+        many = estimate_text_tokens("Documentation paragraph about sockets. " * 50)
+        assert many > one * 40
+
+    def test_estimate_of_empty_text_is_zero(self):
+        assert estimate_text_tokens("") == 0
+
+
+class TestTakeTokenBudget:
+    def test_text_within_budget_is_returned_whole(self):
+        text = "line one\nline two\nline three\n"
+        chunk, next_offset = take_token_budget(text, 0, 25000)
+        assert chunk == text
+        assert next_offset is None
+
+    def test_text_over_budget_is_cut_and_reports_where_to_resume(self):
+        text = ("word " * 20 + "\n") * 500
+        chunk, next_offset = take_token_budget(text, 0, 200)
+        assert 0 < len(chunk) < len(text)
+        assert estimate_text_tokens(chunk) <= 200
+        assert next_offset == len(chunk)
+
+    def test_resuming_at_next_offset_reassembles_the_whole_text(self):
+        text = ("word " * 20 + "\n") * 500
+        parts = []
+        offset = 0
+        while offset is not None:
+            chunk, offset = take_token_budget(text, offset, 200)
+            assert chunk
+            parts.append(chunk)
+        assert "".join(parts) == text
+
+    def test_cut_falls_on_a_line_boundary_when_there_is_one(self):
+        text = ("word " * 20 + "\n") * 500
+        chunk, _ = take_token_budget(text, 0, 200)
+        assert chunk.endswith("\n")
+
+    def test_cut_still_happens_when_a_single_line_exceeds_the_budget(self):
+        text = "x" * 5000
+        chunk, next_offset = take_token_budget(text, 0, 50)
+        assert 0 < len(chunk) < len(text)
+        assert next_offset == len(chunk)
+
+    def test_offset_past_the_end_returns_nothing_more(self):
+        text = "short page\n"
+        chunk, next_offset = take_token_budget(text, len(text), 25000)
+        assert chunk == ""
+        assert next_offset is None
+
+    def test_budget_too_small_for_any_content_still_makes_progress(self):
+        text = "abcdefghij" * 100
+        chunk, next_offset = take_token_budget(text, 0, 1)
+        assert len(chunk) >= 1
+        assert next_offset == len(chunk)
+
+
+class FakeContext:
+    """Minimal stand-in for the MCP Context: records what the tool reported."""
+
+    def __init__(self):
+        self.messages = []
+
+    async def debug(self, message):
+        self.messages.append(("debug", message))
+
+    async def info(self, message):
+        self.messages.append(("info", message))
+
+    async def warning(self, message):
+        self.messages.append(("warning", message))
+
+    async def error(self, message):
+        self.messages.append(("error", message))
+
+
+class FakeResponse:
+    def __init__(self, text):
+        self.text = text
+
+    def raise_for_status(self):
+        return None
+
+
+class FakeClient:
+    def __init__(self, text):
+        self._text = text
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, **kwargs):
+        return FakeResponse(self._text)
+
+
+def page_html(paragraphs):
+    body = "".join(f"<p>{p}</p>" for p in paragraphs)
+    return f"<html><body><article>{body}</article></body></html>"
+
+
+class TestLoadDocumentationPageSize:
+    def _run(self, monkeypatch, html, **kwargs):
+        monkeypatch.setattr(
+            server.httpx, "Client", lambda *a, **kw: FakeClient(html)
+        )
+        ctx = FakeContext()
+        page = asyncio.run(
+            server.load_documentation_page(ctx, "http://127.0.0.1:1234/page", **kwargs)
+        )
+        return page, ctx
+
+    def test_small_page_comes_back_whole(self, monkeypatch):
+        page, _ = self._run(monkeypatch, page_html(["A short documentation page."]))
+        assert "short documentation page" in page.content
+        assert page.truncated is False
+        assert page.next_offset is None
+        assert page.total_characters == len(page.content)
+
+    def test_large_page_is_truncated_and_says_where_to_resume(self, monkeypatch):
+        paragraphs = [f"Paragraph {i} about sockets and buffers." for i in range(4000)]
+        page, ctx = self._run(monkeypatch, page_html(paragraphs), max_tokens=25000)
+        assert page.truncated is True
+        assert page.next_offset == len(page.content)
+        assert page.total_characters > len(page.content)
+        assert estimate_text_tokens(page.content) <= 25000
+        assert any(kind == "warning" for kind, _ in ctx.messages)
+
+    def test_reading_a_page_in_pieces_returns_all_of_it(self, monkeypatch):
+        paragraphs = [f"Paragraph {i} about sockets and buffers." for i in range(4000)]
+        html = page_html(paragraphs)
+        collected = ""
+        offset = 0
+        while True:
+            page, _ = self._run(monkeypatch, html, offset=offset, max_tokens=5000)
+            collected += page.content
+            if page.next_offset is None:
+                break
+            offset = page.next_offset
+        assert len(collected) == page.total_characters
+        assert "Paragraph 3999" in collected
+
+    def test_respects_a_smaller_budget(self, monkeypatch):
+        paragraphs = [f"Paragraph {i} about sockets and buffers." for i in range(4000)]
+        page, _ = self._run(monkeypatch, page_html(paragraphs), max_tokens=500)
+        assert estimate_text_tokens(page.content) <= 500
+        assert page.truncated is True
+
+    def test_rejects_a_negative_offset(self, monkeypatch):
+        page, ctx = self._run(monkeypatch, page_html(["Text."]), offset=-1)
+        assert page.content == ""
+        assert "offset" in page.error
+        assert any(kind == "error" for kind, _ in ctx.messages)
+
+    def test_a_negative_budget_is_refused(self, monkeypatch):
+        page, _ = self._run(monkeypatch, page_html(["Text."]), max_tokens=-1)
+        assert page.content == ""
+        assert "max_tokens" in page.error
+
+    def test_zero_means_no_limit(self, monkeypatch):
+        paragraphs = [f"Paragraph {i} about sockets and buffers." for i in range(4000)]
+        page, _ = self._run(monkeypatch, page_html(paragraphs), max_tokens=0)
+        assert page.truncated is False
+        assert page.next_offset is None
+        assert len(page.content) == page.total_characters
+
+    def test_without_a_budget_the_environment_decides(self, monkeypatch):
+        paragraphs = [f"Paragraph {i} about sockets and buffers." for i in range(4000)]
+        monkeypatch.setenv("DASH_RETRIEVAL_TOKEN_LIMIT", "5000")
+        page, _ = self._run(monkeypatch, page_html(paragraphs))
+        assert page.truncated is True
+        assert estimate_text_tokens(page.content) <= 5000
+
+    def test_with_no_environment_variable_the_whole_page_is_returned(
+        self, monkeypatch
+    ):
+        paragraphs = [f"Paragraph {i} about sockets and buffers." for i in range(4000)]
+        monkeypatch.delenv("DASH_RETRIEVAL_TOKEN_LIMIT", raising=False)
+        page, _ = self._run(monkeypatch, page_html(paragraphs))
+        assert page.truncated is False
+        assert len(page.content) == page.total_characters
+
+    def test_an_explicit_budget_overrides_the_environment(self, monkeypatch):
+        paragraphs = [f"Paragraph {i} about sockets and buffers." for i in range(4000)]
+        monkeypatch.setenv("DASH_RETRIEVAL_TOKEN_LIMIT", "500")
+        page, _ = self._run(monkeypatch, page_html(paragraphs), max_tokens=5000)
+        assert estimate_text_tokens(page.content) > 500
+
+
+class TestTokenLimitFromEnvironment:
+    def test_absent_falls_back_to_the_default(self, monkeypatch):
+        monkeypatch.delenv("DASH_RESPONSE_TOKEN_LIMIT", raising=False)
+        assert server.token_limit("DASH_RESPONSE_TOKEN_LIMIT", 25000) == 25000
+
+    def test_blank_falls_back_to_the_default(self, monkeypatch):
+        monkeypatch.setenv("DASH_RESPONSE_TOKEN_LIMIT", "   ")
+        assert server.token_limit("DASH_RESPONSE_TOKEN_LIMIT", 25000) == 25000
+
+    def test_unparseable_falls_back_rather_than_failing(self, monkeypatch):
+        monkeypatch.setenv("DASH_RESPONSE_TOKEN_LIMIT", "lots")
+        assert server.token_limit("DASH_RESPONSE_TOKEN_LIMIT", 25000) == 25000
+
+    def test_zero_is_honoured_as_no_limit(self, monkeypatch):
+        monkeypatch.setenv("DASH_RESPONSE_TOKEN_LIMIT", "0")
+        assert server.token_limit("DASH_RESPONSE_TOKEN_LIMIT", 25000) == 0
+
+    def test_a_negative_value_reads_as_no_limit(self, monkeypatch):
+        monkeypatch.setenv("DASH_RESPONSE_TOKEN_LIMIT", "-5")
+        assert server.token_limit("DASH_RESPONSE_TOKEN_LIMIT", 25000) == 0
+
+    def test_a_set_value_wins(self, monkeypatch):
+        monkeypatch.setenv("DASH_RESPONSE_TOKEN_LIMIT", "1200")
+        assert server.token_limit("DASH_RESPONSE_TOKEN_LIMIT", 25000) == 1200
