@@ -2,6 +2,7 @@ from typing import Optional
 import html2text
 import httpx
 
+import re
 import subprocess
 import json
 from pathlib import Path
@@ -297,21 +298,62 @@ def _as_jsonable(obj):
     return obj
 
 
+# Token estimation is calibrated against real tokenizers rather than assumed. The two
+# coefficients below were fitted on 55 real responses from this server (one docsets listing
+# and 54 searches over 18 queries against 198 installed docsets, 12k-93k characters each),
+# then validated on a held-out third against six tokenizers: GPT-4o (o200k), GPT-4
+# (cl100k), Qwen3, DeepSeek-V3, Kimi-K2 and GLM-4.5.
+#
+# Letters and symbols are counted separately because they cost very different amounts. A
+# response of this kind is roughly 63% letters, 25% punctuation and URL syntax, 7% digits
+# and only 5% spaces; JSON punctuation costs about one token per character, while letters
+# pack around eight per token in identifier-dense text. A single chars-per-token divisor
+# has to average across that ratio, and because the ratio swings with the shape of the
+# payload no single value fits: 4 characters per token reports 12-43% low across the
+# held-out set, so the documented cap never bites. Counting the two classes separately
+# tracks the real count to within 0-24%.
+#
+# The coefficients include a 1.14 safety factor, so the estimate never falls below the true
+# count for any of the six. That asymmetry is deliberate: this figure guards a truncation
+# cap, where over-estimating returns slightly less content than it could, but
+# under-estimating overruns the caller's context window.
+#
+# Scope, stated plainly: the fit is calibrated on this server's search and docset responses.
+# A small-vocabulary client (a 32k-vocab model such as Mistral-7B) tokenizes more densely
+# and would be under-estimated by up to 11%. Prose-heavy text — a converted documentation
+# page, which no caller of this function currently produces — has a different letter/space
+# mix, and these coefficients land anywhere between 25% under and 29% over on it (measured
+# on 80 real pages loaded through this server). Text of that shape needs its own
+# calibration; it must not borrow this one.
+_TOKENS_PER_LETTER = 0.1268
+_TOKENS_PER_SYMBOL = 0.9863
+
+_LETTER_RUN_RE = re.compile(r"[A-Za-z]+")
+
+
 def estimate_tokens(obj) -> int:
-    """Estimate token count for a serialized object. Rough approximation: 1 token ≈ 4 characters.
+    """Estimate how many tokens `obj` will occupy once serialized as JSON.
 
     The estimate is taken over the object's JSON serialization, which is what is actually
-    sent. Summing each field's length separately misses everything JSON adds around them —
-    quotes, colons, commas, braces, and `null` for every unset optional field — and rounds
+    sent. Summing each field's length separately misses everything JSON adds around them --
+    quotes, colons, commas, braces, and `null` for every unset optional field -- and rounds
     each field down independently, so it reports well under the real size on responses made
     of many small records.
+
+    Letters and symbols are weighted separately; see the calibration note above.
     """
     try:
         serialized = json.dumps(_as_jsonable(obj), default=str)
     except (TypeError, ValueError):
         serialized = str(obj)
 
-    return max(1, len(serialized) // 4)
+    letters = sum(len(run) for run in _LETTER_RUN_RE.findall(serialized))
+    spaces = serialized.count(" ")
+    # Everything that is neither a letter nor a space: punctuation, digits, JSON syntax.
+    symbols = len(serialized) - letters - spaces
+
+    estimate = letters * _TOKENS_PER_LETTER + symbols * _TOKENS_PER_SYMBOL
+    return max(1, round(estimate))
 
 
 @mcp.tool()

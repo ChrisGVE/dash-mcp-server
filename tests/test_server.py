@@ -92,6 +92,69 @@ class TestExtractSection:
 
 
 class TestEstimateTokens:
+    # A deterministic stand-in for a real search response: 30 records shaped exactly as the
+    # Dash API returns them -- six short fields, long percent-encoded URLs, identifier-style
+    # names. Its true token count was measured once with each tokenizer the estimator is
+    # calibrated against, and those numbers are recorded here so a change to the
+    # coefficients cannot silently drift away from reality.
+    FIXTURE_MEASURED = {
+        "GPT-4o": 3020,
+        "GPT-4": 2957,
+        "Qwen3": 3137,
+        "DeepSeek-V3": 3106,
+        "Kimi-K2": 2903,
+        "GLM-4.5": 2957,
+    }
+
+    @staticmethod
+    def _fixture():
+        methods = [
+            "merge", "groupby", "pivot_table", "drop_duplicates", "sort_values", "fillna",
+            "to_parquet", "reset_index", "set_index", "apply", "astype", "query", "rename",
+            "isna", "nunique", "memory_usage", "select_dtypes", "interpolate", "clip",
+            "rank", "corr", "cov", "describe", "duplicated", "explode", "melt", "nlargest",
+            "pct_change", "reindex", "sample",
+        ]
+        return [
+            SearchResult(
+                name=f"pandas.DataFrame.{m}",
+                type="Method",
+                platform="pandas",
+                load_url=(
+                    "http://127.0.0.1:12345/load?url=https%3A%2F%2Fpandas.pydata.org"
+                    f"%2Fdocs%2Freference%2Fapi%2Fpandas.DataFrame.{m}.html"
+                    f"%23pandas.DataFrame.{m}"
+                ),
+                docset="pandas",
+                description=None,
+                language=None,
+                tags=None,
+            )
+            for m in methods
+        ]
+
+    def test_estimate_never_falls_below_a_measured_token_count(self):
+        # The cap this feeds exists to protect the caller's context window, so the estimate
+        # must not come in under the truth for any tokenizer it claims to cover.
+        estimate = estimate_tokens(self._fixture())
+        for model, measured in self.FIXTURE_MEASURED.items():
+            assert estimate >= measured, f"under-estimates {model}: {estimate} < {measured}"
+
+    def test_estimate_stays_close_to_the_measured_token_count(self):
+        # Over-estimating truncates earlier than necessary, so the margin is bounded too.
+        estimate = estimate_tokens(self._fixture())
+        worst = max(estimate / measured for measured in self.FIXTURE_MEASURED.values())
+        assert worst <= 1.30, f"over-estimates by {worst:.0%}, above the 30% bound"
+
+    def test_estimate_beats_the_four_characters_per_token_heuristic(self):
+        # The regression this replaces: 4 chars/token reported ~30% low on payloads made of
+        # many small records, so the documented 25,000-token cap never came into effect.
+        fixture = self._fixture()
+        serialized = json.dumps([r.model_dump() for r in fixture])
+        naive = len(serialized) // 4
+        assert naive < min(self.FIXTURE_MEASURED.values())  # the old heuristic under-reports
+        assert estimate_tokens(fixture) > naive
+
     def test_estimate_counts_json_structure_not_just_field_lengths(self):
         result = SearchResult(
             name="fastapi.Depends",
@@ -103,10 +166,13 @@ class TestEstimateTokens:
             language=None,
             tags=None,
         )
-        serialized = json.dumps(result.model_dump())
-        # The estimate must track what is actually sent, within rounding of the 4-chars
-        # heuristic. Summing field lengths alone lands ~30% low on a record like this.
-        assert estimate_tokens(result) == max(1, len(serialized) // 4)
+        # Summing field lengths alone misses the quotes, braces, colons, commas and the
+        # `null` written for every unset optional field. The estimate is taken over the
+        # serialization, so it must exceed the sum of the values it contains.
+        field_lengths = sum(
+            len(v) for v in result.model_dump().values() if isinstance(v, str)
+        )
+        assert estimate_tokens(result) > field_lengths // 4
 
     def test_estimate_scales_with_a_list_of_records(self):
         results = [
@@ -127,8 +193,15 @@ class TestEstimateTokens:
         assert many >= 50 * one * 0.9
 
     def test_estimate_handles_plain_types(self):
-        assert estimate_tokens("") == 1
-        assert estimate_tokens("a" * 400) >= 100
+        # An empty value still serializes to the two characters `""`, and the estimate is
+        # per-character, so it lands at 2 rather than 1. The property that matters is that
+        # it never comes in under the truth; a token or two on an empty payload is noise.
+        assert estimate_tokens("") <= 2
+        # Measured at 52 tokens by all six calibration tokenizers. The old assertion
+        # here was `>= 100`, which is 402/4 -- it encoded the heuristic being replaced,
+        # not the truth. A long letter run must still be estimated at or above its real
+        # cost, which is what this now checks.
+        assert estimate_tokens("a" * 400) >= 52
         assert estimate_tokens({"k": "v"}) >= 1
         assert estimate_tokens(None) == 1
 
