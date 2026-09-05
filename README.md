@@ -70,7 +70,28 @@ a long page can be read in successive calls by passing `next_offset` back as `of
 }
 ```
 
-An unparseable value falls back to the default rather than failing the server at startup.
+An unparseable or blank value falls back to the default rather than failing the server at
+startup, and a negative one reads as no limit.
+
+The tools describe whatever you set. Each tool's description carries its own limit rather
+than a fixed number, so a model planning a call sees the budget it will actually get — and
+when there is no limit the sentence is dropped rather than reworded:
+
+```
+DASH_RESPONSE_TOKEN_LIMIT unset or 25000
+  list_installed_docsets   ... Results are truncated if they would exceed 25,000 tokens,
+                               set by DASH_RESPONSE_TOKEN_LIMIT.
+
+DASH_RESPONSE_TOKEN_LIMIT=4000
+  list_installed_docsets   ... Results are truncated if they would exceed 4,000 tokens,
+                               set by DASH_RESPONSE_TOKEN_LIMIT.
+
+DASH_RESPONSE_TOKEN_LIMIT=0
+  list_installed_docsets   ... (no truncation sentence at all)
+```
+
+Descriptions are built when the server registers its tools, so changing a variable changes
+what the model is told on the next restart.
 
 ## Requirements
 
