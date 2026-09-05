@@ -356,6 +356,36 @@ def estimate_tokens(obj) -> int:
     return max(1, round(estimate))
 
 
+def fit_within_token_limit(items: list, limit: int) -> list:
+    """Return the longest leading run of `items` whose JSON fits within `limit` tokens.
+
+    Adding up each item's own estimate is not the same as estimating the list. The
+    serialization of a list carries what JSON puts between its members -- a comma
+    after every one of them, and the enclosing brackets -- and none of that appears
+    in any single member's estimate. On a response of a few hundred small records
+    that is around 1.5% unaccounted for, all of it on the side that overruns the
+    budget rather than undershooting it.
+
+    The per-item pass is a cheap way to get close without serializing the whole list
+    once per candidate. The trim afterwards is what makes the answer true: it is
+    measured against the list itself, the way estimate_tokens will measure it.
+    """
+    kept: list = []
+    running = 0
+
+    for item in items:
+        item_tokens = estimate_tokens(item)
+        if running + item_tokens > limit:
+            break
+        kept.append(item)
+        running += item_tokens
+
+    while kept and estimate_tokens(kept) > limit:
+        kept.pop()
+
+    return kept
+
+
 @mcp.tool()
 async def list_installed_docsets(ctx: Context) -> DocsetResults:
     """List all installed documentation sets in Dash. An empty list is returned if the user has no docsets installed.
@@ -378,31 +408,24 @@ async def list_installed_docsets(ctx: Context) -> DocsetResults:
 
         # Build result list with token limit checking
         token_limit = 25000
-        current_tokens = 100  # Base overhead for response structure
-        limited_docsets = []
-
-        for docset in docsets:
-            docset_info = DocsetResult(
-                name=docset["name"],
-                identifier=docset["identifier"],
-                platform=docset["platform"],
-                full_text_search=docset["full_text_search"],
-                notice=docset.get("notice"),
-            )
-
-            # Estimate tokens for this docset
-            docset_tokens = estimate_tokens(docset_info)
-
-            if current_tokens + docset_tokens > token_limit:
-                await ctx.warning(
-                    f"Token limit reached. Returning {len(limited_docsets)} of {len(docsets)} docsets to stay under 25k token limit."
+        limited_docsets = fit_within_token_limit(
+            [
+                DocsetResult(
+                    name=docset["name"],
+                    identifier=docset["identifier"],
+                    platform=docset["platform"],
+                    full_text_search=docset["full_text_search"],
+                    notice=docset.get("notice"),
                 )
-                break
-
-            limited_docsets.append(docset_info)
-            current_tokens += docset_tokens
+                for docset in docsets
+            ],
+            token_limit,
+        )
 
         if len(limited_docsets) < len(docsets):
+            await ctx.warning(
+                f"Token limit reached. Returning {len(limited_docsets)} of {len(docsets)} docsets to stay under 25k token limit."
+            )
             await ctx.info(
                 f"Returned {len(limited_docsets)} docsets (truncated from {len(docsets)} due to token limit)"
             )
@@ -496,34 +519,27 @@ async def search_documentation(
 
         # Build result list with token limit checking
         token_limit = 25000
-        current_tokens = 100  # Base overhead for response structure
-        limited_results = []
-
-        for item in results:
-            search_result = SearchResult(
-                name=item["name"],
-                type=item["type"],
-                platform=item.get("platform"),
-                load_url=item["load_url"],
-                docset=item.get("docset"),
-                description=item.get("description"),
-                language=item.get("language"),
-                tags=item.get("tags"),
-            )
-
-            # Estimate tokens for this result
-            result_tokens = estimate_tokens(search_result)
-
-            if current_tokens + result_tokens > token_limit:
-                await ctx.warning(
-                    f"Token limit reached. Returning {len(limited_results)} of {len(results)} results to stay under 25k token limit."
+        limited_results = fit_within_token_limit(
+            [
+                SearchResult(
+                    name=item["name"],
+                    type=item["type"],
+                    platform=item.get("platform"),
+                    load_url=item["load_url"],
+                    docset=item.get("docset"),
+                    description=item.get("description"),
+                    language=item.get("language"),
+                    tags=item.get("tags"),
                 )
-                break
-
-            limited_results.append(search_result)
-            current_tokens += result_tokens
+                for item in results
+            ],
+            token_limit,
+        )
 
         if len(limited_results) < len(results):
+            await ctx.warning(
+                f"Token limit reached. Returning {len(limited_results)} of {len(results)} results to stay under 25k token limit."
+            )
             await ctx.info(
                 f"Returned {len(limited_results)} results (truncated from {len(results)} due to token limit)"
             )

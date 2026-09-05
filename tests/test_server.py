@@ -4,6 +4,7 @@ from dash_mcp_server.server import (
     SearchResult,
     estimate_tokens,
     extract_section,
+    fit_within_token_limit,
     parse_fragment,
 )
 
@@ -207,3 +208,49 @@ class TestEstimateTokens:
 
     def test_estimate_survives_a_non_serializable_value(self):
         assert estimate_tokens({"when": object()}) >= 1
+
+
+def search_results(count):
+    return [
+        SearchResult(
+            name=f"example_symbol_{i}",
+            type="Function",
+            platform="python",
+            load_url=f"http://127.0.0.1:1234/page{i}",
+            docset="Python",
+            description=f"Documentation for example_symbol_{i}.",
+        )
+        for i in range(count)
+    ]
+
+
+class TestFitWithinTokenLimit:
+    def test_a_list_that_fits_is_returned_whole(self):
+        rows = search_results(3)
+        assert fit_within_token_limit(rows, 25000) == rows
+
+    def test_an_empty_list_stays_empty(self):
+        assert fit_within_token_limit([], 25000) == []
+
+    def test_the_kept_list_is_measured_as_a_list_not_as_a_sum(self):
+        """The commas and brackets between records belong to the budget too.
+
+        A running per-item total misses them, which is how a response of a few
+        hundred small records lands over the limit it was trimmed to.
+        """
+        rows = search_results(400)
+        kept = fit_within_token_limit(rows, 25000)
+
+        assert 0 < len(kept) < len(rows)
+        assert estimate_tokens(kept) <= 25000
+        assert sum(estimate_tokens(row) for row in rows[: len(kept)]) < estimate_tokens(
+            kept
+        )
+
+    def test_one_more_record_would_not_have_fitted(self):
+        rows = search_results(400)
+        kept = fit_within_token_limit(rows, 25000)
+        assert estimate_tokens(rows[: len(kept) + 1]) > 25000
+
+    def test_a_limit_below_the_first_record_keeps_nothing(self):
+        assert fit_within_token_limit(search_results(10), 1) == []
