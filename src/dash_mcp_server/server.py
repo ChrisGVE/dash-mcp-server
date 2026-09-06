@@ -517,7 +517,7 @@ async def search_documentation(
             else:
                 await ctx.error(f"Bad request: {error_text}")
                 return SearchResults(
-                    error=[f"Bad request: {error_text}. Please ensure Dash is running and the API server is enabled (in Dash Settings > Integration)."]
+                    error=[f"Bad request: {error_text}."]
                 )
         elif e.response.status_code == 403:
             error_text = e.response.text
@@ -531,17 +531,29 @@ async def search_documentation(
             else:
                 await ctx.error(f"Forbidden: {error_text}")
                 return SearchResults(
-                    error=[f"Forbidden: {error_text}. Please ensure Dash is running and the API server is enabled (in Dash Settings > Integration)."]
+                    error=[f"Forbidden: {error_text}."]
                 )
         await ctx.error(f"HTTP error: {e}")
         return SearchResults(
-            error=[f"HTTP error: {e}. Please ensure Dash is running and the API server is enabled (in Dash Settings > Integration)."]
+            error=[f"HTTP error: {e}."]
+        )
+    except KeyError as e:
+        # Dash answered, but a result was missing a field the model requires. Reported as
+        # the payload problem it is: the bare KeyError repr is just a quoted field name,
+        # and the connection advice that used to follow it pointed at the one thing the
+        # successful response had already proved was fine.
+        await ctx.error(f"Unexpected search result shape: missing field {e}")
+        return SearchResults(
+            error=[
+                f"Dash returned a result missing the {e} field, which this server "
+                f"requires. The search itself reached Dash and succeeded."
+            ]
         )
     except Exception as e:
+        # Anything reaching here is past a successful health check and a successful
+        # request, so whatever went wrong, it was not the connection.
         await ctx.error(f"Search failed: {e}")
-        return SearchResults(
-            error=[f"Search failed: {e}. Please ensure Dash is running and the API server is enabled (in Dash Settings > Integration)."]
-        )
+        return SearchResults(error=[f"Search failed: {e}."])
 
 
 @mcp.tool()

@@ -1,5 +1,7 @@
 import asyncio
 
+import httpx
+
 from dash_mcp_server import server
 from dash_mcp_server.server import parse_fragment, extract_section
 
@@ -233,3 +235,119 @@ class TestSearchDiagnostics:
         assert results.results == []
         assert len(results.error) == 1
         assert "Dash API Server" in results.error[0]
+
+
+class AdviceFakeResponse:
+    """A response that can carry a status and a body, so an error path can be exercised."""
+
+    def __init__(self, status_code=200, text="", payload=None):
+        self.status_code = status_code
+        self.text = text
+        self._payload = payload if payload is not None else {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"{self.status_code} error", request=None, response=self
+            )
+
+    def json(self):
+        return self._payload
+
+
+class AdviceFakeClient:
+    def __init__(self, response):
+        self._response = response
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, **kwargs):
+        return self._response
+
+
+class TestErrorAdviceIsTruthful:
+    """The 'is Dash running?' advice must only appear when Dash might not be running.
+
+    Every handler below is reached only after `working_api_base_url` has health-checked
+    the API and returned a base URL, so by the time they run the connection has already
+    succeeded. Telling the caller to check whether Dash is running sends them to inspect
+    the one thing that is provably fine.
+    """
+
+    ADVICE = "Please ensure Dash is running"
+
+    def _search(self, monkeypatch, response):
+        async def fake_base_url(ctx):
+            return "http://127.0.0.1:1234"
+
+        monkeypatch.setattr(server, "working_api_base_url", fake_base_url)
+        monkeypatch.setattr(
+            server.httpx, "Client", lambda *a, **kw: AdviceFakeClient(response)
+        )
+        ctx = FakeContext()
+        results = asyncio.run(
+            server.search_documentation(
+                ctx, query="buffer", docset_identifiers="python", search_snippets=False
+            )
+        )
+        return results, ctx
+
+    def test_a_bad_request_does_not_blame_the_connection(self, monkeypatch):
+        response = AdviceFakeResponse(400, text="Something the API disliked")
+        results, _ = self._search(monkeypatch, response)
+        assert results.error is not None
+        assert not any(self.ADVICE in e for e in results.error)
+
+    def test_an_expired_trial_does_not_blame_the_connection(self, monkeypatch):
+        # A 403 is Dash answering, so this is the sharpest case: the server demonstrably
+        # replied, and the old text still asked whether it was running.
+        response = AdviceFakeResponse(
+            403, text="API access blocked due to Dash trial expiration"
+        )
+        results, _ = self._search(monkeypatch, response)
+        assert results.error is not None
+        assert not any(self.ADVICE in e for e in results.error)
+
+    def test_a_forbidden_for_another_reason_does_not_blame_the_connection(
+        self, monkeypatch
+    ):
+        response = AdviceFakeResponse(403, text="Nope")
+        results, _ = self._search(monkeypatch, response)
+        assert not any(self.ADVICE in e for e in results.error)
+
+    def test_a_server_error_does_not_blame_the_connection(self, monkeypatch):
+        response = AdviceFakeResponse(500, text="boom")
+        results, _ = self._search(monkeypatch, response)
+        assert not any(self.ADVICE in e for e in results.error)
+
+    def test_a_malformed_result_names_the_payload_not_the_connection(self, monkeypatch):
+        # Dash answered 200 with a result missing the required `name` field. Upstream
+        # reported this as `Search failed: 'name'` — a bare KeyError repr — followed by
+        # advice to check whether Dash was running.
+        response = AdviceFakeResponse(
+            200, payload={"results": [{"type": "Class", "load_url": "http://x/y"}]}
+        )
+        results, _ = self._search(monkeypatch, response)
+        assert results.error is not None
+        message = " ".join(results.error)
+        assert self.ADVICE not in message
+        assert "name" in message
+        assert "unexpected" in message.lower() or "missing" in message.lower()
+
+    def test_a_failed_connection_still_gives_the_advice(self, monkeypatch):
+        # The one place the advice is true, and it must survive.
+        async def no_base_url(ctx):
+            return None
+
+        monkeypatch.setattr(server, "working_api_base_url", no_base_url)
+        ctx = FakeContext()
+        results = asyncio.run(
+            server.search_documentation(
+                ctx, query="buffer", docset_identifiers="python", search_snippets=False
+            )
+        )
+        assert any(self.ADVICE in e for e in results.error)
